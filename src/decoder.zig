@@ -2,30 +2,72 @@ const std = @import("std");
 const print = std.debug.print;
 const eql = std.mem.eql;
 const expect = std.testing.expect;
+const test_allocator = std.testing.allocator;
+const Allocator = std.mem.Allocator;
 
 const Error = struct { code: []const u8, message: []const u8 };
 
-const Value = union(enum) { String: []const u8, BlobString: []const u8, Number: i64, Float: f64, Boolean: bool, Error: Error, BlobError: Error, Null: bool };
+const Value = union(enum) {
+    const Self = @This();
+
+    String: []const u8,
+    BlobString: []const u8,
+    Number: i64,
+    Float: f64,
+    Boolean: bool,
+    Error: Error,
+    BlobError: Error,
+    Null: bool,
+    Array: std.ArrayList(Value),
+
+    pub fn deinit(self: Self) void {
+        switch (self) {
+            .Array => |value| {
+                // deinit all items recursively
+                for (value.items) |v| {
+                    v.deinit();
+                }
+                // finally deinit original to avoid segmentation fault error
+                value.deinit();
+            },
+            else => {
+                // TODO
+            },
+        }
+    }
+};
 
 pub const DecoderError = error{ ExpectedLength, EndOfMessage, InvalidCharacter, ExpectedCRLF, ExpectedEOL, UnhandledMessageType, UnexpectedCharacterAfterNull, InvalidBooleanValue, InternalError };
 
 pub const Decoder = struct {
-    msg: []const u8 = undefined,
+    const Self = @This();
 
-    read_position: usize = 0,
+    msg: []const u8,
 
-    pub fn decode(self: *Decoder) DecoderError!Value {
+    read_position: usize,
+
+    allocator: std.mem.Allocator,
+
+    pub fn init(msg: []const u8, allocator: std.mem.Allocator) Self {
+        return Self{ .msg = msg, .read_position = 0, .allocator = allocator };
+    }
+
+    pub fn decode(self: *Self) DecoderError!Value {
         return try self.readNext();
     }
 
-    fn peekChar(self: *Decoder) DecoderError!u8 {
+    pub fn deinit(_: *Self) void {
+        // TODO
+    }
+
+    fn peekChar(self: *Self) DecoderError!u8 {
         if (self.read_position >= self.msg.len) {
             return DecoderError.EndOfMessage;
         }
         return self.msg[self.read_position];
     }
 
-    fn readNext(self: *Decoder) DecoderError!Value {
+    fn readNext(self: *Self) DecoderError!Value {
         if (self.readByte()) |byte| {
             return switch (byte) {
                 '+' => try self.decodeString(),
@@ -43,7 +85,7 @@ pub const Decoder = struct {
         return DecoderError.EndOfMessage;
     }
 
-    fn readByte(self: *Decoder) ?u8 {
+    fn readByte(self: *Self) ?u8 {
         const msg = self.msg;
         if (self.read_position >= msg.len) {
             return null;
@@ -53,12 +95,12 @@ pub const Decoder = struct {
         return char;
     }
 
-    fn decodeString(self: *Decoder) DecoderError!Value {
+    fn decodeString(self: *Self) DecoderError!Value {
         const line = try self.readUntilNewLine();
         return Value{ .String = line };
     }
 
-    fn decodeBlobString(self: *Decoder) DecoderError!Value {
+    fn decodeBlobString(self: *Self) DecoderError!Value {
         const length = try self.readLengthLine();
         const bytes = try self.readBytes(length);
         const nextChar = try self.peekChar();
@@ -68,7 +110,7 @@ pub const Decoder = struct {
         return Value{ .BlobString = bytes };
     }
 
-    fn decodeInteger(self: *Decoder) DecoderError!Value {
+    fn decodeInteger(self: *Self) DecoderError!Value {
         const line = try self.readUntilNewLine();
         const integer = std.fmt.parseInt(i64, line, 10) catch |err| switch (err) {
             error.Overflow => return DecoderError.InternalError,
@@ -77,7 +119,7 @@ pub const Decoder = struct {
         return Value{ .Number = integer };
     }
 
-    fn decodeFloat(self: *Decoder) DecoderError!Value {
+    fn decodeFloat(self: *Self) DecoderError!Value {
         const line = try self.readUntilNewLine();
         if (eql(u8, line, "inf")) {
             return Value{ .Float = std.math.inf(f64) };
@@ -90,7 +132,7 @@ pub const Decoder = struct {
         return Value{ .Float = float };
     }
 
-    fn decodeBoolean(self: *Decoder) DecoderError!Value {
+    fn decodeBoolean(self: *Self) DecoderError!Value {
         const line = try self.readUntilNewLine();
         if (line.len > 1) {
             return DecoderError.InvalidCharacter;
@@ -104,13 +146,13 @@ pub const Decoder = struct {
         return DecoderError.InvalidCharacter;
     }
 
-    fn decodeError(self: *Decoder) DecoderError!Value {
+    fn decodeError(self: *Self) DecoderError!Value {
         const line = try self.readUntilNewLine();
         const error_value = try self.parseError(line);
         return Value{ .Error = error_value };
     }
 
-    fn decodeBlobError(self: *Decoder) DecoderError!Value {
+    fn decodeBlobError(self: *Self) DecoderError!Value {
         const length = try self.readLengthLine();
         const bytes = try self.readBytes(length);
         const nextChar = try self.peekChar();
@@ -120,7 +162,7 @@ pub const Decoder = struct {
         return Value{ .BlobError = try self.parseError(bytes) };
     }
 
-    fn decodeNull(self: *Decoder) DecoderError!Value {
+    fn decodeNull(self: *Self) DecoderError!Value {
         const nextChar = try self.peekChar();
         if (nextChar != '\r') {
             return DecoderError.UnexpectedCharacterAfterNull;
@@ -129,12 +171,23 @@ pub const Decoder = struct {
         return Value{ .Null = true };
     }
 
-    fn decodeArray(self: *Decoder) DecoderError!Value {
-        _ = self;
-        return Value{ .Boolean = true };
+    fn decodeArray(self: *Self) DecoderError!Value {
+        const length = try self.readLengthLine();
+        var list = std.ArrayList(Value).init(self.allocator);
+        if (length == 0) {
+            return Value{ .Array = list };
+        }
+        for (0..length) |_| {
+            const nextValue = try self.readNext();
+            list.append(nextValue) catch {
+                // TODO better error codes
+                return DecoderError.InternalError;
+            };
+        }
+        return Value{ .Array = list };
     }
 
-    fn readBytes(self: *Decoder, length: usize) DecoderError![]const u8 {
+    fn readBytes(self: *Self, length: usize) DecoderError![]const u8 {
         try self.assertIsEnded();
         const msg = self.msg;
         const read_position = self.read_position;
@@ -147,7 +200,7 @@ pub const Decoder = struct {
         return value;
     }
 
-    fn readUntilNewLine(self: *Decoder) DecoderError![]const u8 {
+    fn readUntilNewLine(self: *Self) DecoderError![]const u8 {
         try self.assertIsEnded();
         const msg = self.msg;
         const current_position = self.read_position;
@@ -166,7 +219,7 @@ pub const Decoder = struct {
         return msg[current_position..new_line_index];
     }
 
-    fn eatNewLine(self: *Decoder) DecoderError!void {
+    fn eatNewLine(self: *Self) DecoderError!void {
         try self.assertIsEnded();
         const current_index = self.read_position;
         const next_two_bytes = self.msg[current_index .. current_index + 2];
@@ -176,13 +229,13 @@ pub const Decoder = struct {
         self.read_position += 2;
     }
 
-    fn assertIsEnded(self: *Decoder) DecoderError!void {
+    fn assertIsEnded(self: *Self) DecoderError!void {
         if (self.read_position >= self.msg.len) {
             return DecoderError.EndOfMessage;
         }
     }
 
-    fn readLengthLine(self: *Decoder) DecoderError!usize {
+    fn readLengthLine(self: *Self) DecoderError!usize {
         const nextChar = try self.peekChar();
         if (nextChar < '0' or nextChar > '9') {
             return DecoderError.ExpectedLength;
@@ -195,7 +248,7 @@ pub const Decoder = struct {
         return length;
     }
 
-    fn parseError(_: *Decoder, raw: []const u8) DecoderError!Error {
+    fn parseError(_: *Self, raw: []const u8) DecoderError!Error {
         var error_code_length: usize = 0;
         while (error_code_length < raw.len) : (error_code_length += 1) {
             const char = raw[error_code_length];
@@ -207,100 +260,150 @@ pub const Decoder = struct {
     }
 };
 
+pub fn decodeFromSlice(allocator: Allocator, msg: []const u8) DecoderError!Value {
+    var decoder = Decoder.init(msg, allocator);
+    defer decoder.deinit();
+    return try decoder.decode();
+}
+
+test "decodeFromSlice" {
+    const value = try decodeFromSlice(test_allocator, "+OK\r\n");
+    defer value.deinit();
+    try expect(eql(u8, value.String, "OK"));
+}
+
 test "decode simple string" {
-    var decoder = Decoder{ .msg = "+OK\r\n" };
+    var decoder = Decoder.init("+OK\r\n", test_allocator);
     const value = try decoder.decode();
     try expect(eql(u8, value.String, "OK"));
 }
 
 test "decode blob string" {
-    var decoder = Decoder{ .msg = "$2\r\nOK\r\n" };
+    var decoder = Decoder.init("$2\r\nOK\r\n", test_allocator);
     var value = try decoder.decode();
     try expect(eql(u8, value.BlobString, "OK"));
-    decoder = Decoder{ .msg = "$0\r\n\r\n" };
+    decoder = Decoder.init("$0\r\n\r\n", test_allocator);
     value = try decoder.decode();
     try expect(eql(u8, value.BlobString, ""));
-    decoder = Decoder{ .msg = "$adff\r\nOK\r\n" };
+    decoder = Decoder.init("$adff\r\nOK\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
         try expect(err == DecoderError.ExpectedLength);
     };
-    decoder = Decoder{ .msg = "$2\r\nO\r\n" };
+    decoder = Decoder.init("$2\r\nO\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
         try expect(err == DecoderError.ExpectedEOL);
     };
 }
 
 test "decode integer" {
-    var decoder = Decoder{ .msg = ":100\r\n" };
+    var decoder = Decoder.init(":100\r\n", test_allocator);
     var value = try decoder.decode();
     try expect(value.Number == 100);
-    decoder = Decoder{ .msg = ":-100\r\n" };
+    decoder = Decoder.init(":-100\r\n", test_allocator);
     value = try decoder.decode();
     try expect(value.Number == -100);
 }
 
 test "decode float" {
-    var decoder = Decoder{ .msg = ",2.2\r\n" };
+    var decoder = Decoder.init(",2.2\r\n", test_allocator);
     var value = try decoder.decode();
     try expect(value.Float == 2.2);
-    decoder = Decoder{ .msg = ",-2.2\r\n" };
+    decoder = Decoder.init(",-2.2\r\n", test_allocator);
     value = try decoder.decode();
     try expect(value.Float == -2.2);
-    decoder = Decoder{ .msg = ",inf\r\n" };
+    decoder = Decoder.init(",inf\r\n", test_allocator);
     value = try decoder.decode();
     try expect(std.math.isInf(value.Float));
-    decoder = Decoder{ .msg = ",-inf\r\n" };
+    decoder = Decoder.init(",-inf\r\n", test_allocator);
     value = try decoder.decode();
     try expect(std.math.isNegativeInf(value.Float));
-    decoder = Decoder{ .msg = ",nan\r\n" };
+    decoder = Decoder.init(",nan\r\n", test_allocator);
     value = try decoder.decode();
     try expect(std.math.isNan(value.Float));
 }
 
 test "decode boolean" {
-    var decoder = Decoder{ .msg = "#t\r\n" };
+    var decoder = Decoder.init("#t\r\n", test_allocator);
     var value = try decoder.decode();
     try expect(value.Boolean == true);
-    decoder = Decoder{ .msg = "#f\r\n" };
+    decoder = Decoder.init("#f\r\n", test_allocator);
     value = try decoder.decode();
     try expect(value.Boolean == false);
 }
 
 test "decode error" {
-    var decoder = Decoder{ .msg = "-ERR Something went wrong\r\n" };
+    var decoder = Decoder.init("-ERR Something went wrong\r\n", test_allocator);
     var value = try decoder.decode();
     try expect(eql(u8, value.Error.code, "ERR"));
     try expect(eql(u8, value.Error.message, "Something went wrong"));
-    decoder = Decoder{ .msg = "-ERR\r\n" };
+    decoder = Decoder.init("-ERR\r\n", test_allocator);
     value = try decoder.decode();
     try expect(eql(u8, value.Error.code, "ERR"));
     try expect(eql(u8, value.Error.message, ""));
 }
 
 test "decode blob error" {
-    var decoder = Decoder{ .msg = "!24\r\nERR Something went wrong\r\n" };
+    var decoder = Decoder.init("!24\r\nERR Something went wrong\r\n", test_allocator);
     var value = try decoder.decode();
     try expect(eql(u8, value.BlobError.code, "ERR"));
     try expect(eql(u8, value.BlobError.message, "Something went wrong"));
-    decoder = Decoder{ .msg = "!3\r\nERR\r\n" };
+    decoder = Decoder.init("!3\r\nERR\r\n", test_allocator);
     value = try decoder.decode();
     try expect(eql(u8, value.BlobError.code, "ERR"));
     try expect(eql(u8, value.BlobError.message, ""));
-    decoder = Decoder{ .msg = "!\r\nERR\r\n" };
+    decoder = Decoder.init("!\r\nERR\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
         try expect(err == DecoderError.ExpectedLength);
     };
 }
 
 test "decode null" {
-    var decoder = Decoder{ .msg = "_\r\n" };
+    var decoder = Decoder.init("_\r\n", test_allocator);
     const value = try decoder.decode();
     try expect(value.Null);
 }
 
 test "unhandled message type" {
-    var decoder = Decoder{ .msg = "^OK\r\n" };
+    var decoder = Decoder.init("^OK\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
         try expect(err == DecoderError.UnhandledMessageType);
     };
+}
+
+test "zero length array" {
+    var decoder = Decoder.init("*0\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Array.items.len == 0);
+}
+
+test "array of string" {
+    var decoder = Decoder.init("*2\r\n+Hello\r\n+World!\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Array.items.len == 2);
+    try expect(eql(u8, value.Array.items[0].String, "Hello"));
+    try expect(eql(u8, value.Array.items[1].String, "World!"));
+}
+
+test "array of mixed values" {
+    var decoder = Decoder.init("*2\r\n+Hello\r\n:100\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Array.items.len == 2);
+    try expect(eql(u8, value.Array.items[0].String, "Hello"));
+    try expect(value.Array.items[1].Number == 100);
+}
+
+test "array with nested arrays" {
+    var decoder = Decoder.init("*2\r\n+Hello\r\n*3\r\n+World!\r\n:100\r\n*1\r\n#t\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Array.items.len == 2);
+    try expect(eql(u8, value.Array.items[0].String, "Hello"));
+    try expect(value.Array.items[1].Array.items.len == 3);
+    try expect(eql(u8, value.Array.items[1].Array.items[0].String, "World!"));
+    try expect(value.Array.items[1].Array.items[1].Number == 100);
+    try expect(value.Array.items[1].Array.items[2].Array.items.len == 1);
+    try expect(value.Array.items[1].Array.items[2].Array.items[0].Boolean == true);
 }
