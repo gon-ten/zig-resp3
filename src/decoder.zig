@@ -23,16 +23,19 @@ const Value = union(enum) {
     Null: bool,
     Array: std.ArrayList(Value),
     Map: std.StringHashMap(Value),
+    Push: std.ArrayList(Value),
+    Set: std.ArrayList(Value),
+    Attributes: std.StringHashMap(Value),
 
     pub fn deinit(self: Value) void {
         switch (self) {
-            .Array => |value| {
+            .Push, .Array, .Set => |value| {
                 defer value.deinit();
                 for (value.items) |v| {
                     v.deinit();
                 }
             },
-            .Map => |value| {
+            .Map, .Attributes => |value| {
                 var v = value;
                 defer v.deinit();
                 var iterator = value.iterator();
@@ -47,7 +50,7 @@ const Value = union(enum) {
     }
 };
 
-pub const DecoderError = error{ ExpectedLength, EndOfMessage, InvalidCharacter, ExpectedCRLF, ExpectedEOL, UnhandledMessageType, UnexpectedCharacterAfterNull, InvalidBooleanValue, InternalError, InvalidVerbatimStringFormat, InvalidCharacterAfterVerbatimFormat };
+pub const DecoderError = error{ ExpectedLength, EndOfMessage, InvalidCharacter, ExpectedCRLF, ExpectedEOL, UnhandledMessageType, UnexpectedCharacterAfterNull, InvalidBooleanValue, InternalError, InvalidVerbatimStringFormat, InvalidCharacterAfterVerbatimFormat, PushExpectedString, PushZeroLength, IllegalPushPosition };
 
 pub const Decoder = struct {
     const Self = @This();
@@ -91,6 +94,9 @@ pub const Decoder = struct {
             '*' => try self.decodeArray(),
             '=' => try self.decodeVerbatimString(),
             '%' => try self.decodeMap(),
+            '>' => try self.decodePush(),
+            '~' => try self.decodeSet(),
+            '|' => try self.decodeAttributes(),
             else => DecoderError.UnhandledMessageType,
         };
     }
@@ -216,13 +222,47 @@ pub const Decoder = struct {
             return Value{ .Array = list };
         }
         for (0..length) |_| {
-            const nextValue = try self.readNext();
-            list.append(nextValue) catch {
+            const value = try self.readNext();
+
+            switch (value) {
+                .Push => {
+                    list.deinit();
+                    value.deinit();
+                    return DecoderError.IllegalPushPosition;
+                },
+                else => {},
+            }
+
+            list.append(value) catch {
                 // TODO better error codes
                 return DecoderError.InternalError;
             };
         }
         return Value{ .Array = list };
+    }
+
+    fn decodePush(self: *Self) DecoderError!Value {
+        const array_value = try self.decodeArray();
+
+        if (array_value.Array.items.len == 0) {
+            array_value.deinit();
+            return DecoderError.PushZeroLength;
+        }
+
+        switch (array_value.Array.items[0]) {
+            .String => {},
+            else => {
+                array_value.deinit();
+                return DecoderError.PushExpectedString;
+            },
+        }
+
+        return Value{ .Push = array_value.Array };
+    }
+
+    fn decodeSet(self: *Self) DecoderError!Value {
+        const array_value = try self.decodeArray();
+        return Value{ .Set = array_value.Array };
     }
 
     fn decodeMap(self: *Self) DecoderError!Value {
@@ -239,7 +279,18 @@ pub const Decoder = struct {
                     else => return DecoderError.InvalidCharacter,
                 }
             };
+
             const value = try self.readNext();
+
+            switch (value) {
+                .Push => {
+                    hashMap.deinit();
+                    value.deinit();
+                    return DecoderError.IllegalPushPosition;
+                },
+                else => {},
+            }
+
             hashMap.put(key_val, value) catch {
                 // TODO better error codes
                 return DecoderError.InternalError;
@@ -247,6 +298,11 @@ pub const Decoder = struct {
         }
 
         return Value{ .Map = hashMap };
+    }
+
+    fn decodeAttributes(self: *Self) DecoderError!Value {
+        const map_value = try self.decodeMap();
+        return Value{ .Attributes = map_value.Map };
     }
 
     fn readBytes(self: *Self, length: usize) DecoderError![]const u8 {
@@ -482,7 +538,7 @@ test "unhandled message type" {
     };
 }
 
-test "zero length array" {
+test "array zero length" {
     var decoder = Decoder.init("*0\r\n", test_allocator);
     const value = try decoder.decode();
     defer _ = value.deinit();
@@ -518,6 +574,13 @@ test "array with nested arrays" {
     try expect(value.Array.items[1].Array.items[1].Number == 100);
     try expect(value.Array.items[1].Array.items[2].Array.items.len == 1);
     try expect(value.Array.items[1].Array.items[2].Array.items[0].Boolean == true);
+}
+
+test "array with push type inside" {
+    var decoder = Decoder.init("*2\r\n+key\r\n>1\r\n+get\r\n", test_allocator);
+    _ = decoder.decode() catch |err| {
+        try expect(err == DecoderError.IllegalPushPosition);
+    };
 }
 
 test "verbatim string" {
@@ -605,4 +668,110 @@ test "map with aggregates" {
     defer _ = value.deinit();
     try expect(value.Map.get("array").?.Array.items.len == 1);
     try expect(value.Map.get("array").?.Array.items[0].Boolean == true);
+}
+
+test "map with push type inside" {
+    var decoder = Decoder.init("%1\r\n+key\r\n>1\r\n+get\r\n", test_allocator);
+    _ = decoder.decode() catch |err| {
+        try expect(err == DecoderError.IllegalPushPosition);
+    };
+}
+
+test "attributes basic" {
+    var decoder = Decoder.init("|2\r\n+key1\r\n+value1\r\n+key2\r\n+value2\r\n", test_allocator);
+    var value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(eql(u8, value.Attributes.get("key1").?.String, "value1"));
+    try expect(eql(u8, value.Attributes.get("key2").?.String, "value2"));
+}
+
+test "attributes basic multiple types" {
+    var decoder = Decoder.init("|2\r\n+number\r\n:100\r\n+string\r\n+value\r\n", test_allocator);
+    var value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Attributes.get("number").?.Number == 100);
+    try expect(eql(u8, value.Attributes.get("string").?.String, "value"));
+}
+
+test "attributes with invalid key type" {
+    var decoder = Decoder.init("|2\r\n:100\r\n:100\r\n+string\r\n+value\r\n", test_allocator);
+    _ = decoder.decode() catch |err| {
+        try expect(err == DecoderError.InvalidCharacter);
+    };
+}
+
+test "attributes with key but not value" {
+    var decoder = Decoder.init("|2\r\n+key\r\n", test_allocator);
+    _ = decoder.decode() catch |err| {
+        try expect(err == DecoderError.EndOfMessage);
+    };
+}
+
+test "attributes with aggregates" {
+    var decoder = Decoder.init("|1\r\n+array\r\n*1\r\n#t\r\n", test_allocator);
+    var value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Attributes.get("array").?.Array.items.len == 1);
+    try expect(value.Attributes.get("array").?.Array.items[0].Boolean == true);
+}
+
+test "set zero length" {
+    var decoder = Decoder.init("~0\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Set.items.len == 0);
+}
+
+test "set of string" {
+    var decoder = Decoder.init("~2\r\n+Hello\r\n+World!\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Set.items.len == 2);
+    try expect(eql(u8, value.Set.items[0].String, "Hello"));
+    try expect(eql(u8, value.Set.items[1].String, "World!"));
+}
+
+test "set of mixed values" {
+    var decoder = Decoder.init("~2\r\n+Hello\r\n:100\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Set.items.len == 2);
+    try expect(eql(u8, value.Set.items[0].String, "Hello"));
+    try expect(value.Set.items[1].Number == 100);
+}
+
+test "set with nested arrays" {
+    var decoder = Decoder.init("~2\r\n+Hello\r\n*3\r\n+World!\r\n:100\r\n*1\r\n#t\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Set.items.len == 2);
+    try expect(eql(u8, value.Set.items[0].String, "Hello"));
+    try expect(value.Set.items[1].Array.items.len == 3);
+    try expect(eql(u8, value.Set.items[1].Array.items[0].String, "World!"));
+    try expect(value.Set.items[1].Array.items[1].Number == 100);
+    try expect(value.Set.items[1].Array.items[2].Array.items.len == 1);
+    try expect(value.Set.items[1].Array.items[2].Array.items[0].Boolean == true);
+}
+
+test "push zero length" {
+    var decoder = Decoder.init(">0\r\n", test_allocator);
+    _ = decoder.decode() catch |err| {
+        try expect(err == DecoderError.PushZeroLength);
+    };
+}
+
+test "push of string" {
+    var decoder = Decoder.init(">2\r\n+Hello\r\n+World!\r\n", test_allocator);
+    const value = try decoder.decode();
+    defer _ = value.deinit();
+    try expect(value.Push.items.len == 2);
+    try expect(eql(u8, value.Push.items[0].String, "Hello"));
+    try expect(eql(u8, value.Push.items[1].String, "World!"));
+}
+
+test "push first position is not a string" {
+    var decoder = Decoder.init(">2\r\n:100\r\n:100\r\n", test_allocator);
+    _ = decoder.decode() catch |err| {
+        try expect(err == DecoderError.PushExpectedString);
+    };
 }
