@@ -25,7 +25,7 @@ const Value = union(enum) {
     Map: std.StringHashMap(Value),
     Push: std.ArrayList(Value),
     Set: std.ArrayList(Value),
-    Attributes: std.StringHashMap(Value),
+    Attribute: std.StringHashMap(Value),
 
     pub fn deinit(self: Value) void {
         switch (self) {
@@ -35,7 +35,7 @@ const Value = union(enum) {
                     v.deinit();
                 }
             },
-            .Map, .Attributes => |value| {
+            .Map, .Attribute => |value| {
                 var v = value;
                 defer v.deinit();
                 var iterator = value.iterator();
@@ -50,7 +50,7 @@ const Value = union(enum) {
     }
 };
 
-pub const DecoderError = error{ ExpectedLength, EndOfMessage, InvalidCharacter, ExpectedCRLF, ExpectedEOL, UnhandledMessageType, UnexpectedCharacterAfterNull, InvalidBooleanValue, InternalError, InvalidVerbatimStringFormat, InvalidCharacterAfterVerbatimFormat, PushExpectedString, PushZeroLength, IllegalPushPosition };
+pub const DecoderError = error{ ExpectedLength, EndOfMessage, InvalidCharacter, ExpectedCRLF, ExpectedEOL, UnexpectedCharacterAfterNull, InvalidBooleanValue, InternalError, InvalidVerbatimStringFormat, InvalidCharacterAfterVerbatimFormat, PushExpectedString, PushZeroLength, IllegalPushPosition, Unsupported };
 
 pub const Decoder = struct {
     const Self = @This();
@@ -96,8 +96,12 @@ pub const Decoder = struct {
             '%' => try self.decodeMap(),
             '>' => try self.decodePush(),
             '~' => try self.decodeSet(),
-            '|' => try self.decodeAttributes(),
-            else => DecoderError.UnhandledMessageType,
+            '|' => try self.decodeAttribute(),
+            ')' => {
+                // TODO Big int support
+                return DecoderError.Unsupported;
+            },
+            else => DecoderError.Unsupported,
         };
     }
 
@@ -300,9 +304,9 @@ pub const Decoder = struct {
         return Value{ .Map = hashMap };
     }
 
-    fn decodeAttributes(self: *Self) DecoderError!Value {
+    fn decodeAttribute(self: *Self) DecoderError!Value {
         const map_value = try self.decodeMap();
-        return Value{ .Attributes = map_value.Map };
+        return Value{ .Attribute = map_value.Map };
     }
 
     fn readBytes(self: *Self, length: usize) DecoderError![]const u8 {
@@ -531,10 +535,10 @@ test "null" {
     try expect(value.Null);
 }
 
-test "unhandled message type" {
+test "unsupported message type" {
     var decoder = Decoder.init("^OK\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
-        try expect(err == DecoderError.UnhandledMessageType);
+        try expect(err == DecoderError.Unsupported);
     };
 }
 
@@ -677,42 +681,42 @@ test "map with push type inside" {
     };
 }
 
-test "attributes basic" {
+test "attribute basic" {
     var decoder = Decoder.init("|2\r\n+key1\r\n+value1\r\n+key2\r\n+value2\r\n", test_allocator);
     var value = try decoder.decode();
     defer _ = value.deinit();
-    try expect(eql(u8, value.Attributes.get("key1").?.String, "value1"));
-    try expect(eql(u8, value.Attributes.get("key2").?.String, "value2"));
+    try expect(eql(u8, value.Attribute.get("key1").?.String, "value1"));
+    try expect(eql(u8, value.Attribute.get("key2").?.String, "value2"));
 }
 
-test "attributes basic multiple types" {
+test "attribute basic multiple types" {
     var decoder = Decoder.init("|2\r\n+number\r\n:100\r\n+string\r\n+value\r\n", test_allocator);
     var value = try decoder.decode();
     defer _ = value.deinit();
-    try expect(value.Attributes.get("number").?.Number == 100);
-    try expect(eql(u8, value.Attributes.get("string").?.String, "value"));
+    try expect(value.Attribute.get("number").?.Number == 100);
+    try expect(eql(u8, value.Attribute.get("string").?.String, "value"));
 }
 
-test "attributes with invalid key type" {
+test "attribute with invalid key type" {
     var decoder = Decoder.init("|2\r\n:100\r\n:100\r\n+string\r\n+value\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
         try expect(err == DecoderError.InvalidCharacter);
     };
 }
 
-test "attributes with key but not value" {
+test "attribute with key but not value" {
     var decoder = Decoder.init("|2\r\n+key\r\n", test_allocator);
     _ = decoder.decode() catch |err| {
         try expect(err == DecoderError.EndOfMessage);
     };
 }
 
-test "attributes with aggregates" {
+test "attribute with aggregates" {
     var decoder = Decoder.init("|1\r\n+array\r\n*1\r\n#t\r\n", test_allocator);
     var value = try decoder.decode();
     defer _ = value.deinit();
-    try expect(value.Attributes.get("array").?.Array.items.len == 1);
-    try expect(value.Attributes.get("array").?.Array.items[0].Boolean == true);
+    try expect(value.Attribute.get("array").?.Array.items.len == 1);
+    try expect(value.Attribute.get("array").?.Array.items[0].Boolean == true);
 }
 
 test "set zero length" {
